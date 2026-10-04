@@ -45,9 +45,6 @@ export class BarcodeSalesService {
     return `POS-${dateStr}-${(count + 1).toString().padStart(4, '0')}`;
   }
 
-  /**
-   * دالة مساعدة لتحديث مصفوفة التيكيتات والمقادير بالمخزون العام عند البيع أو الإرجاع
-   */
   private async updateParentInventory(
     inventoryId: Types.ObjectId | string,
     grossWeight: number,
@@ -106,14 +103,12 @@ export class BarcodeSalesService {
     await parentInventory.save({ session });
   }
 
-  /**
-   * دالة مساعدة لمعالجة وجلب معرف العميل بآمان بجميع الحالات (ID، اسم، أو رقم هاتف)
-   */
   private async resolveCustomerId(dto: {
     customerId?: string;
-    customerName?: string;
+    customerName: string;
     phoneNumber?: string;
-  }): Promise<Types.ObjectId | undefined> {
+    country?: string;
+  }): Promise<Types.ObjectId> {
     if (dto.customerId && Types.ObjectId.isValid(dto.customerId)) {
       const customer = await this.customersService.findById(dto.customerId);
       if (customer) {
@@ -121,44 +116,49 @@ export class BarcodeSalesService {
       }
     }
 
-    if (dto.customerName && dto.customerName.trim() !== '') {
-      const cleanName = dto.customerName.trim();
-      const cleanPhone = dto.phoneNumber?.trim();
+    const cleanName = dto.customerName?.trim();
+    if (!cleanName) {
+      throw new BadRequestException('اسم العميل مطلوب لإنشاء الفاتورة');
+    }
 
-      if (cleanPhone) {
-        const existingByPhone: any = await this.customersService.findByPhone(cleanPhone);
-        if (existingByPhone?._id) {
-          return existingByPhone._id as Types.ObjectId;
-        }
-      }
+    const cleanPhone =
+      dto.phoneNumber && dto.phoneNumber.trim() !== ''
+        ? dto.phoneNumber.trim()
+        : undefined;
+    const cleanCountry =
+      dto.country && dto.country.trim() !== '' ? dto.country.trim() : undefined;
 
-      const existingByName: any = await (this.customersService as any).customerModel?.findOne({
-        fullName: cleanName,
-        status: 'ACTIVE',
-      });
-      if (existingByName?._id) {
-        return existingByName._id as Types.ObjectId;
-      }
-
-      try {
-        const newCustomer: any = await this.customersService.create({
-          fullName: cleanName,
-          phoneNumber: cleanPhone,
-        } as any);
-        if (newCustomer?._id) {
-          return newCustomer._id as Types.ObjectId;
-        }
-      } catch (e) {
-        // حماية عند فشل الإنشاء التلقائي
+    if (cleanPhone) {
+      const existingByPhone: any =
+        await this.customersService.findByPhone(cleanPhone);
+      if (existingByPhone?._id) {
+        return existingByPhone._id as Types.ObjectId;
       }
     }
 
-    return undefined;
+    const existingByName: any = await (
+      this.customersService as any
+    ).customerModel?.findOne({
+      fullName: cleanName,
+      status: 'ACTIVE',
+    });
+    if (existingByName?._id) {
+      return existingByName._id as Types.ObjectId;
+    }
+
+    const newCustomer: any = await this.customersService.create({
+      fullName: cleanName,
+      phoneNumber: cleanPhone,
+      country: cleanCountry,
+    } as any);
+
+    if (newCustomer?._id) {
+      return newCustomer._id as Types.ObjectId;
+    }
+
+    throw new BadRequestException('تعذر إنشاء أو ربط حساب العميل بالفاتورة');
   }
 
-  /**
-   * دالة محسّنة ومضغوطة لاستخراج وتحسين الصور وتقليل حجم البيانات بالـ Response
-   */
   private extractItemImages(item: any): string[] {
     const rawItem = item?.toObject ? item.toObject() : item || {};
     const parentInv = rawItem.inventoryRef || {};
@@ -174,16 +174,21 @@ export class BarcodeSalesService {
 
     if (!rawUrl || typeof rawUrl !== 'string') return [];
 
-    // تحسين رابط الصورة إن كانت مستضافة على Cloudinary للحصول على الحجم والمقاس الأمثل
     let optimizedUrl = rawUrl;
-    if (optimizedUrl.includes('res.cloudinary.com') && !optimizedUrl.includes('q_auto')) {
-      optimizedUrl = optimizedUrl.replace('/upload/', '/upload/f_auto,q_auto,w_300/');
+    if (
+      optimizedUrl.includes('res.cloudinary.com') &&
+      !optimizedUrl.includes('q_auto')
+    ) {
+      optimizedUrl = optimizedUrl.replace(
+        '/upload/',
+        '/upload/f_auto,q_auto,w_300/',
+      );
     }
 
     return [optimizedUrl];
   }
 
-  // 1. إتمام عملية البيع بالباركود وإصدار الفاتورة
+  // 1. إنشاء فاتورة مبيعات
   async createInvoice(
     dto: CreateBarcodeInvoiceDto,
     userId: string,
@@ -235,19 +240,40 @@ export class BarcodeSalesService {
           );
         }
 
-        const goldPrice = saleItem.goldPricePerGram;
-        const makingCharge =
-          saleItem.makingChargePerGram ?? item.makingChargePerGram;
-
+        const goldPrice = parseFloat(saleItem.goldPricePerGram.toFixed(2));
         const goldTotalPrice = parseFloat(
           (item.netWeight * goldPrice).toFixed(2),
         );
-        const totalMakingCharge = parseFloat(
-          (item.netWeight * makingCharge).toFixed(2),
-        );
-        const finalPrice = parseFloat(
-          (goldTotalPrice + totalMakingCharge).toFixed(2),
-        );
+
+        let finalPrice: number;
+        let makingCharge: number;
+        let totalMakingCharge: number;
+
+        // دعم التعديل اليدوي المباشر للإجمالي إذا تم إرساله من الواجهة
+        if (saleItem.finalPrice !== undefined && saleItem.finalPrice > 0) {
+          finalPrice = parseFloat(saleItem.finalPrice.toFixed(2));
+          totalMakingCharge = parseFloat(
+            Math.max(0, finalPrice - goldTotalPrice).toFixed(2),
+          );
+          makingCharge = parseFloat(
+            (item.netWeight > 0
+              ? totalMakingCharge / item.netWeight
+              : 0
+            ).toFixed(2),
+          );
+        } else {
+          makingCharge = parseFloat(
+            (saleItem.makingChargePerGram ?? item.makingChargePerGram).toFixed(
+              2,
+            ),
+          );
+          totalMakingCharge = parseFloat(
+            (item.netWeight * makingCharge).toFixed(2),
+          );
+          finalPrice = parseFloat(
+            (goldTotalPrice + totalMakingCharge).toFixed(2),
+          );
+        }
 
         const itemImages = this.extractItemImages(item);
 
@@ -320,6 +346,7 @@ export class BarcodeSalesService {
         finalPaidAmount: grandTotalAmount,
         totalAmount: grandTotalAmount,
         customer: finalCustomerId,
+        customerCountry: dto.country?.trim() || '',
         createdBy: new Types.ObjectId(userId),
         status: 'ACTIVE',
         isCancelled: false,
@@ -345,12 +372,12 @@ export class BarcodeSalesService {
     }
   }
 
-  // 2. جلب جميع الفواتير (مع تحسين الصور)
+  // 2. جلب جميع الفواتير
   async findAllInvoices(): Promise<BarcodeInvoice[]> {
     const invoices = await this.invoiceModel
       .find({ isCancelled: false })
       .populate('createdBy', 'fullName name email')
-      .populate('customer', 'fullName phoneNumber')
+      .populate('customer', 'fullName phoneNumber country')
       .populate({
         path: 'items.item',
         select: 'imageUrl images image inventoryRef',
@@ -387,7 +414,7 @@ export class BarcodeSalesService {
     const invoice = await this.invoiceModel
       .findById(id)
       .populate('createdBy', 'fullName name email')
-      .populate('customer', 'fullName phoneNumber')
+      .populate('customer', 'fullName phoneNumber country')
       .populate({
         path: 'items.item',
         select: 'imageUrl images image inventoryRef',
@@ -565,19 +592,39 @@ export class BarcodeSalesService {
           });
         }
 
-        const goldPrice = saleItem.goldPricePerGram;
-        const makingCharge =
-          saleItem.makingChargePerGram ?? item.makingChargePerGram;
-
+        const goldPrice = parseFloat(saleItem.goldPricePerGram.toFixed(2));
         const goldTotalPrice = parseFloat(
           (item.netWeight * goldPrice).toFixed(2),
         );
-        const totalMakingCharge = parseFloat(
-          (item.netWeight * makingCharge).toFixed(2),
-        );
-        const finalPrice = parseFloat(
-          (goldTotalPrice + totalMakingCharge).toFixed(2),
-        );
+
+        let finalPrice: number;
+        let makingCharge: number;
+        let totalMakingCharge: number;
+
+        if (saleItem.finalPrice !== undefined && saleItem.finalPrice > 0) {
+          finalPrice = parseFloat(saleItem.finalPrice.toFixed(2));
+          totalMakingCharge = parseFloat(
+            Math.max(0, finalPrice - goldTotalPrice).toFixed(2),
+          );
+          makingCharge = parseFloat(
+            (item.netWeight > 0
+              ? totalMakingCharge / item.netWeight
+              : 0
+            ).toFixed(2),
+          );
+        } else {
+          makingCharge = parseFloat(
+            (saleItem.makingChargePerGram ?? item.makingChargePerGram).toFixed(
+              2,
+            ),
+          );
+          totalMakingCharge = parseFloat(
+            (item.netWeight * makingCharge).toFixed(2),
+          );
+          finalPrice = parseFloat(
+            (goldTotalPrice + totalMakingCharge).toFixed(2),
+          );
+        }
 
         const itemImages = this.extractItemImages(item);
 
@@ -606,7 +653,9 @@ export class BarcodeSalesService {
       }
 
       const oldAmount = existingInvoice.finalPaidAmount;
-      const amountDifference = grandTotalAmount - oldAmount;
+      const amountDifference = parseFloat(
+        (grandTotalAmount - oldAmount).toFixed(2),
+      );
 
       if (amountDifference > 0) {
         await this.safeService.triggerTransaction(
@@ -628,7 +677,10 @@ export class BarcodeSalesService {
       existingInvoice.totalNetWeight = grandTotalNetWeight;
       existingInvoice.finalPaidAmount = grandTotalAmount;
       existingInvoice.totalAmount = grandTotalAmount;
-      existingInvoice.customer = updatedCustomerId ?? existingInvoice.customer;
+      existingInvoice.customer = updatedCustomerId;
+      if (dto.country !== undefined) {
+        existingInvoice.customerCountry = dto.country.trim();
+      }
 
       await existingInvoice.save({ session });
 
@@ -643,13 +695,12 @@ export class BarcodeSalesService {
     }
   }
 
-  // 5. إلغاء الفاتورة (محمية ضد הـ Race Condition والـ Double Click بالكامل)
+  // 5. إلغاء الفاتورة
   async cancelInvoice(id: string, userId: string): Promise<BarcodeInvoice> {
     if (!Types.ObjectId.isValid(id)) {
       throw new BadRequestException('معرف الفاتورة غير صالح');
     }
 
-    // 🔒 1. قفل الفاتورة ذرّياً قبل البدء في أي عملية (Atomic Lock)
     const lockedInvoice = await this.invoiceModel.findOneAndUpdate(
       { _id: id, isCancelled: false },
       { $set: { isCancelled: true, status: 'CANCELLED' } },
@@ -661,7 +712,9 @@ export class BarcodeSalesService {
       if (!checkInvoice) {
         throw new NotFoundException('الفاتورة غير موجودة');
       }
-      throw new ConflictException('تم إلغاء الفاتورة بالفعل، أو يتم معالجة طلب إلغاء سابق حالياً');
+      throw new ConflictException(
+        'تم إلغاء الفاتورة بالفعل، أو يتم معالجة طلب إلغاء سابق حالياً',
+      );
     }
 
     const session = await this.connection.startSession();
@@ -720,7 +773,6 @@ export class BarcodeSalesService {
       await session.abortTransaction();
       session.endSession();
 
-      // التراجع عن حالة القفل في حال حدوث خطأ غير متوقع
       await this.invoiceModel.updateOne(
         { _id: id },
         { $set: { isCancelled: false, status: 'ACTIVE' } },

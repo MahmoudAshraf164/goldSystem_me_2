@@ -335,7 +335,7 @@ export class InventoryService {
     private readonly movementsService: StockMovementsService,
   ) {}
 
-  // 1. إنشاء مجموعة مخزون رئيسية جديدة (تكون فارغة وقابلة للتكويذ بناءً عليها)
+  // 1. إنشاء مجموعة مخزون رئيسية جديدة
   async create(
     createInventoryDto: CreateInventoryDto,
     userId: string,
@@ -347,7 +347,6 @@ export class InventoryService {
 
     const categoryObjectId = new Types.ObjectId(createInventoryDto.category);
 
-    // التحقق من عدم وجود مجموعة بنفس الخصائص لتجنب التكرار
     const existing = await this.inventoryModel.findOne({
       title: createInventoryDto.title.trim(),
       category: categoryObjectId,
@@ -368,6 +367,7 @@ export class InventoryService {
       initialCount: 0,
       currentCount: 0,
       initialGrossWeight: 0,
+      initialNetWeight: 0,
       totalGrossWeight: 0,
       totalNetWeight: 0,
       tagDetails: [],
@@ -388,7 +388,7 @@ export class InventoryService {
     return savedItem;
   }
 
-  // 2. تعديل بيانات مجموعة المخزون الأساسية (تغيير العنوان أو الشركة)
+  // 2. تعديل بيانات مجموعة المخزون الأساسية
   async update(
     id: string,
     updateInventoryDto: UpdateInventoryDto,
@@ -402,7 +402,11 @@ export class InventoryService {
       throw new NotFoundException('مجموعة الذهب المطلوبة غير موجودة أو مؤرشفة');
     }
 
-    const updateData: any = { ...updateInventoryDto };
+    const updateData: Record<string, any> = {};
+
+    if (updateInventoryDto.title !== undefined) {
+      updateData.title = updateInventoryDto.title.trim();
+    }
 
     if (updateInventoryDto.companyName !== undefined) {
       updateData.companyName = updateInventoryDto.companyName.trim() || '-';
@@ -412,13 +416,36 @@ export class InventoryService {
       updateData.category = new Types.ObjectId(updateInventoryDto.category);
     }
 
+    if (updateInventoryDto.initialCount !== undefined) {
+      updateData.initialCount = updateInventoryDto.initialCount;
+    }
+
+    if (updateInventoryDto.initialGrossWeight !== undefined) {
+      updateData.initialGrossWeight = updateInventoryDto.initialGrossWeight;
+    }
+
     const updatedItem = await this.inventoryModel
-      .findByIdAndUpdate(id, updateData, { new: true })
+      .findByIdAndUpdate(id, { $set: updateData }, { new: true })
       .populate('category', 'name')
       .exec();
 
     if (!updatedItem) {
       throw new NotFoundException('مجموعة الذهب المطلوبة غير موجودة أو مؤرشفة');
+    }
+
+    if (
+      updateInventoryDto.initialCount !== undefined ||
+      updateInventoryDto.initialGrossWeight !== undefined
+    ) {
+      await this.movementsService.logMovement({
+        inventoryItem: updatedItem._id.toString(),
+        type: 'INVENTORY_IN',
+        countChange: 0,
+        grossWeightChange: 0,
+        netWeightChange: 0,
+        actionBy: userId,
+        reason: `تعديل القيمة الابتدائية للمجموعة: (${updatedItem.title}) - العدد الأولي الجديد: ${updatedItem.initialCount}`,
+      });
     }
 
     return updatedItem;
@@ -429,7 +456,7 @@ export class InventoryService {
     status: string = 'ACTIVE',
     karat?: number,
     companyName?: string,
-  ): Promise<InventoryDocument[]> {
+  ): Promise<any[]> {
     const isArchivedQuery = status.toUpperCase() === 'ARCHIVED';
     const filter: any = { isArchived: isArchivedQuery };
 
@@ -442,15 +469,23 @@ export class InventoryService {
       }
     }
 
-    return this.inventoryModel
+    const items = await this.inventoryModel
       .find(filter)
       .populate('category', 'name')
       .sort({ createdAt: -1 })
       .exec();
+
+    return items.map((item) => {
+      const itemObj: any = item.toObject();
+      if (!itemObj.category) {
+        itemObj.category = { _id: null, name: 'غير محدد' };
+      }
+      return itemObj;
+    });
   }
 
   // 4. جلب مجموعة بالـ ID
-  async findById(id: string): Promise<InventoryDocument> {
+  async findById(id: string): Promise<any> {
     const item = await this.inventoryModel
       .findOne({ _id: id, isArchived: false })
       .populate('category', 'name')
@@ -460,7 +495,12 @@ export class InventoryService {
       throw new NotFoundException('المجموعة غير موجودة');
     }
 
-    return item;
+    const itemObj: any = item.toObject();
+    if (!itemObj.category) {
+      itemObj.category = { _id: null, name: 'غير محدد' };
+    }
+
+    return itemObj;
   }
 
   // 5. أرشفة مجموعة مخزون (Soft Delete)

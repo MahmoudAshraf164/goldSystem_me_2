@@ -31,11 +31,36 @@ export class BarcodeInventoryService {
     private readonly movementsService: StockMovementsService,
   ) {}
 
+  // توليد باركود فريد يضمن عدم التكرار حتى عند الحذف أو الأرشفة
   private async generateUniqueBarcode(karat: number): Promise<string> {
     const currentYear = new Date().getFullYear().toString();
-    const count = await this.barcodeInventoryModel.countDocuments().exec();
-    const nextSequence = (count + 1).toString().padStart(5, '0');
-    return `${karat}${currentYear}${nextSequence}`;
+    const prefix = `${karat}${currentYear}`;
+
+    const lastItem = await this.barcodeInventoryModel
+      .findOne({ barcode: new RegExp(`^${prefix}`) })
+      .sort({ barcode: -1 })
+      .exec();
+
+    let sequence = 1;
+
+    if (lastItem && lastItem.barcode) {
+      const lastSeqStr = lastItem.barcode.slice(prefix.length);
+      const parsedSeq = parseInt(lastSeqStr, 10);
+      if (!isNaN(parsedSeq)) {
+        sequence = parsedSeq + 1;
+      }
+    }
+
+    let candidateBarcode = `${prefix}${sequence.toString().padStart(5, '0')}`;
+
+    let exists = await this.barcodeInventoryModel.exists({ barcode: candidateBarcode });
+    while (exists) {
+      sequence++;
+      candidateBarcode = `${prefix}${sequence.toString().padStart(5, '0')}`;
+      exists = await this.barcodeInventoryModel.exists({ barcode: candidateBarcode });
+    }
+
+    return candidateBarcode;
   }
 
   private updateTagDetailsList(
@@ -84,7 +109,7 @@ export class BarcodeInventoryService {
     };
   }
 
-  // 1. إضافة قطعة باركود جديدة وتحديث المخزون الرئيسي آلياً
+  // 1. إضافة قطعة باركود جديدة وتحديث المخزون الرئيسي آلياً (الأولي والحالي)
   async createItem(
     dto: CreateBarcodeItemDto,
     userId: string,
@@ -124,7 +149,6 @@ export class BarcodeInventoryService {
     try {
       let inventoryItem: InventoryDocument | null = null;
 
-      // أ) البحث بالـ ID إن وُجد
       if (dto.inventoryId && Types.ObjectId.isValid(dto.inventoryId)) {
         inventoryItem = await this.inventoryModel
           .findOne({ _id: dto.inventoryId, isArchived: false })
@@ -132,7 +156,6 @@ export class BarcodeInventoryService {
           .exec();
       }
 
-      // ب) التجميع التلقائي بناءً على العيار والشركة والتصنيف إن لم يُمرر inventoryId
       if (!inventoryItem) {
         const filter: any = {
           karat: dto.karat,
@@ -147,7 +170,6 @@ export class BarcodeInventoryService {
           .exec();
       }
 
-      // ج) إنشاء المجموعة آلياً إن لم توجد مسبقاً
       if (!inventoryItem) {
         inventoryItem = new this.inventoryModel({
           title: dto.title,
@@ -157,16 +179,20 @@ export class BarcodeInventoryService {
           initialCount: 1,
           currentCount: 1,
           initialGrossWeight: dto.grossWeight,
+          initialNetWeight: netWeight,
           totalGrossWeight: dto.grossWeight,
           totalNetWeight: netWeight,
           tagDetails: tagWeight > 0 ? [{ count: 1, weight: tagWeight }] : [],
         });
       } else {
-        // د) تحديث إحصائيات المخزون الرئيسي آلياً
+        // زيادة الأعداد والأوزان الحالية والابتدائية
         inventoryItem.initialCount += 1;
         inventoryItem.currentCount += 1;
         inventoryItem.initialGrossWeight = parseFloat(
-          (inventoryItem.initialGrossWeight + dto.grossWeight).toFixed(3),
+          ((inventoryItem.initialGrossWeight || 0) + dto.grossWeight).toFixed(3),
+        );
+        inventoryItem.initialNetWeight = parseFloat(
+          ((inventoryItem.initialNetWeight || 0) + netWeight).toFixed(3),
         );
         inventoryItem.totalGrossWeight = parseFloat(
           (inventoryItem.totalGrossWeight + dto.grossWeight).toFixed(3),
@@ -262,7 +288,7 @@ export class BarcodeInventoryService {
     return items.map((item) => this.formatItemWithImages(item));
   }
 
-  // 4. تعديل قطعة الباركود وإعادة مزامنة الحسابات مع المخزون الرئيسي
+  // 4. تعديل قطعة الباركود وإعادة مزامنة الحسابات والوزن الابتدائي في المخزون الرئيسي
   async updateItem(
     idOrBarcode: string,
     updateDto: UpdateBarcodeItemDto,
@@ -313,16 +339,23 @@ export class BarcodeInventoryService {
     const oldInvId = item.inventoryRef ? item.inventoryRef.toString() : null;
     const newInvId = rawNewInvId ? rawNewInvId.toString() : oldInvId;
 
-    // نقل القطعة من مخزون إلى آخر
+    // نقل القطعة من مجموعة مخزونية لأخرى
     if (oldInvId && newInvId && oldInvId !== newInvId) {
       const oldInv = await this.inventoryModel.findById(oldInvId).exec();
       if (oldInv) {
         oldInv.currentCount = Math.max(0, oldInv.currentCount - 1);
+        oldInv.initialCount = Math.max(0, oldInv.initialCount - 1);
         oldInv.totalGrossWeight = parseFloat(
           Math.max(0, oldInv.totalGrossWeight - item.grossWeight).toFixed(3),
         );
         oldInv.totalNetWeight = parseFloat(
           Math.max(0, oldInv.totalNetWeight - item.netWeight).toFixed(3),
+        );
+        oldInv.initialGrossWeight = parseFloat(
+          Math.max(0, (oldInv.initialGrossWeight || 0) - item.grossWeight).toFixed(3),
+        );
+        oldInv.initialNetWeight = parseFloat(
+          Math.max(0, (oldInv.initialNetWeight || 0) - item.netWeight).toFixed(3),
         );
         oldInv.tagDetails = this.updateTagDetailsList(
           oldInv.tagDetails,
@@ -335,11 +368,18 @@ export class BarcodeInventoryService {
       const newInv = await this.inventoryModel.findById(newInvId).exec();
       if (newInv) {
         newInv.currentCount += 1;
+        newInv.initialCount += 1;
         newInv.totalGrossWeight = parseFloat(
           (newInv.totalGrossWeight + grossWeight).toFixed(3),
         );
         newInv.totalNetWeight = parseFloat(
           (newInv.totalNetWeight + netWeight).toFixed(3),
+        );
+        newInv.initialGrossWeight = parseFloat(
+          ((newInv.initialGrossWeight || 0) + grossWeight).toFixed(3),
+        );
+        newInv.initialNetWeight = parseFloat(
+          ((newInv.initialNetWeight || 0) + netWeight).toFixed(3),
         );
         newInv.tagDetails = this.updateTagDetailsList(
           newInv.tagDetails,
@@ -349,7 +389,7 @@ export class BarcodeInventoryService {
         await newInv.save();
       }
     } else if (newInvId) {
-      // تعديل الأوزان والـ Tags بنفس المخزون الرئيسي
+      // تعديل الوزنة في نفس المجموعة (يعدل القائم والصافي الحالي والابتدائي معاً)
       const weightDiffGross = parseFloat(
         (grossWeight - item.grossWeight).toFixed(3),
       );
@@ -362,6 +402,12 @@ export class BarcodeInventoryService {
         );
         invItem.totalNetWeight = parseFloat(
           (invItem.totalNetWeight + weightDiffNet).toFixed(3),
+        );
+        invItem.initialGrossWeight = parseFloat(
+          ((invItem.initialGrossWeight || 0) + weightDiffGross).toFixed(3),
+        );
+        invItem.initialNetWeight = parseFloat(
+          ((invItem.initialNetWeight || 0) + weightDiffNet).toFixed(3),
         );
 
         if (item.tagWeight !== tagWeight) {
@@ -420,7 +466,7 @@ export class BarcodeInventoryService {
     return this.formatItemWithImages(updatedItem);
   }
 
-  // 5. الحذف الناعم والتنقيص التلقائي من المخزون الرئيسي
+  // 5. الحذف والتنقيص التلقائي من الأعداد والأوزان الابتدائية والحالية
   async softDelete(id: string, userId: string): Promise<void> {
     const item = await this.barcodeInventoryModel
       .findOne({ _id: id, isArchived: false })
@@ -444,11 +490,18 @@ export class BarcodeInventoryService {
         .exec();
       if (invItem) {
         invItem.currentCount = Math.max(0, invItem.currentCount - 1);
+        invItem.initialCount = Math.max(0, invItem.initialCount - 1);
         invItem.totalGrossWeight = parseFloat(
           Math.max(0, invItem.totalGrossWeight - item.grossWeight).toFixed(3),
         );
         invItem.totalNetWeight = parseFloat(
           Math.max(0, invItem.totalNetWeight - item.netWeight).toFixed(3),
+        );
+        invItem.initialGrossWeight = parseFloat(
+          Math.max(0, (invItem.initialGrossWeight || 0) - item.grossWeight).toFixed(3),
+        );
+        invItem.initialNetWeight = parseFloat(
+          Math.max(0, (invItem.initialNetWeight || 0) - item.netWeight).toFixed(3),
         );
 
         if (item.tagWeight > 0) {
@@ -511,7 +564,7 @@ export class BarcodeInventoryService {
     }
   }
 
-  // 8. البيع الخصم التلقائي من المخزون الرئيسي
+  // 8. عند البيع: ينقص المتبقي الحالي فقط ويبقى الوزن والعدد الابتدائي ثابتاً
   async markAsSold(barcode: string, session?: any): Promise<BarcodeInventory> {
     const item = await this.barcodeInventoryModel
       .findOne({ barcode: barcode.trim(), isArchived: false })
